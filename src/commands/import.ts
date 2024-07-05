@@ -28,6 +28,7 @@ import {
   getGitHubProductInformation,
 } from '../github-products.js';
 import { POSTHOG_API_KEY, POSTHOG_HOST } from '../posthog.js';
+import { exceptions } from 'winston';
 
 const command = new commander.Command();
 const { Option } = commander;
@@ -49,6 +50,7 @@ interface Arguments {
   inputPath: string;
   projectOwner: string;
   projectOwnerType: ProjectOwnerType;
+  projectNumber?: number;
   projectTitle?: string;
   proxyUrl: string | undefined;
   repositoryMappingsPath: string;
@@ -174,6 +176,87 @@ const createProject = async ({
   )) as { createProjectV2: { projectV2: { id: string; url: string } } };
 
   return response.createProjectV2.projectV2;
+};
+
+const getGlobalIdForProject = async ({
+  owner,
+  ownerType,
+  number,
+  octokit,
+}: {
+  owner: string;
+  ownerType: ProjectOwnerType;
+  number: number;
+  octokit: Octokit;
+}): Promise<{ id: string; url: string }> => {
+  switch (ownerType) {
+    case ProjectOwnerType.Organization:
+      return await getGlobalIdForOrganizationOwnedProject({
+        organization: owner,
+        number,
+        octokit,
+      });
+    case ProjectOwnerType.User:
+      return await getGlobalIdForUserOwnedProject({
+        user: owner,
+        number,
+        octokit,
+      });
+  }
+};
+
+const getGlobalIdForOrganizationOwnedProject = async ({
+  organization,
+  number,
+  octokit,
+}: {
+  organization: string;
+  number: number;
+  octokit: Octokit;
+}): Promise<{ id: string; url: string }> => {
+  const response = (await octokit.graphql(
+    `query getProjectGlobalId($organization: String!, $number: Int!) {
+      organization(login: $organization) {
+        projectV2(number: $number) {
+          id
+          url
+        }
+      }
+    }`,
+    {
+      organization,
+      number,
+    },
+  )) as { organization: { projectV2: { id: string, url: string } } };
+
+  return response.organization.projectV2;
+};
+
+const getGlobalIdForUserOwnedProject = async ({
+  user,
+  number,
+  octokit,
+}: {
+  user: string;
+  number: number;
+  octokit: Octokit;
+}): Promise<{ id: string; url: string }> => {
+  const response = (await octokit.graphql(
+    `query getProjectGlobalId($user: String!, $number: Int!) {
+      user(login: $user) {
+        projectV2(number: $number) {
+          id
+          url
+        }
+      }
+    }`,
+    {
+      user,
+      number,
+    },
+  )) as { user: { projectV2: { id: string ; url : string } } };
+
+  return response.user.projectV2;
 };
 
 interface SelectOption {
@@ -813,6 +896,11 @@ command
     'repository-mappings.csv',
   )
   .option(
+    '--project-number <project_number>',
+    'Configure to export to an existing project (e.g 1,2,3)',
+    (value) => parseInt(value),
+  )
+  .option(
     '--project-title <project_name>',
     'The title to use for the imported project. Defaults to the title of the source project.',
   )
@@ -854,6 +942,7 @@ command
         inputPath,
         projectOwner,
         projectOwnerType,
+        projectNumber,
         projectTitle,
         proxyUrl,
         repositoryMappingsPath,
@@ -973,12 +1062,27 @@ command
 
       const title = projectTitle || sourceProject.title;
 
-      const { id: targetProjectId, url: targetProjectUrl } = await createProject({
-        octokit,
-        ownerId,
-        title,
-      });
-      logger.info(`Created project "${title}" with ID ${targetProjectId}`);
+      if (projectNumber) {
+        const owner = projectOwner;
+        const ownerType = projectOwnerType;
+        const number = projectNumber;
+        var { id: targetProjectId, url: targetProjectUrl } = await getGlobalIdForProject({
+          owner,
+          ownerType, 
+          number,
+          octokit,
+        });
+        logger.info(`Found project with ID ${targetProjectId}`);
+      } else {
+        logger.info(`Number "${projectNumber}"??`)
+        //var { id: targetProjectId, url: targetProjectUrl } = await createProject({
+        //  octokit,
+        //  ownerId,
+        //  title,
+        //});
+        logger.info(`Created project "${title}" with ID ${targetProjectId}`);
+      }
+
 
       const sourceProjectRepositoriesCount = sourceProject.repositories.nodes.length;
 
@@ -1035,54 +1139,58 @@ command
 
       logger.info(`Creating ${customFieldsToCreate.length} custom field(s)...`);
 
-      for (const customFieldToCreate of customFieldsToCreate) {
-        const { id, dataType, name, options } = customFieldToCreate;
-        const fieldOptionsForCreation = options
-          ? options.map((option) => {
-              const newOption = {
-                name: option.name,
-                description: option.description,
-                color: option.color,
-              } as SelectOption;
+      try {
+        for (const customFieldToCreate of customFieldsToCreate) {
+          const { id, dataType, name, options } = customFieldToCreate;
+          const fieldOptionsForCreation = options
+            ? options.map((option) => {
+                const newOption = {
+                  name: option.name,
+                  description: option.description,
+                  color: option.color,
+                } as SelectOption;
 
-              if (typeof option.description === 'undefined') {
-                logger.warn(
-                  `Added a placeholder description for option "${option.name}" on custom field "${name}"`,
-                );
-                newOption.description = 'Placeholder description';
-              }
+                if (typeof option.description === 'undefined') {
+                  logger.warn(
+                    `Added a placeholder description for option "${option.name}" on custom field "${name}"`,
+                  );
+                  newOption.description = 'Placeholder description';
+                }
 
-              if (typeof option.color === 'undefined') {
-                logger.warn(
-                  `Added a default color for option "${option.name}" on custom field "${name}"`,
-                );
-                newOption.color = ProjectSingleSelectFieldOptionColor.BLUE;
-              }
+                if (typeof option.color === 'undefined') {
+                  logger.warn(
+                    `Added a default color for option "${option.name}" on custom field "${name}"`,
+                  );
+                  newOption.color = ProjectSingleSelectFieldOptionColor.BLUE;
+                }
 
-              return newOption;
-            })
-          : [];
+                return newOption;
+              })
+            : [];
 
-        const createdField = await createProjectField({
-          octokit,
-          projectId: targetProjectId,
-          name,
-          dataType,
-          singleSelectOptions: fieldOptionsForCreation,
-        });
+          const createdField = await createProjectField({
+            octokit,
+            projectId: targetProjectId,
+            name,
+            dataType,
+            singleSelectOptions: fieldOptionsForCreation,
+          });
 
-        // If our newly created field has options, we need to correlate the old and new option IDs
-        const optionMappings = options
-          ? correlateCustomFieldOptions(options, createdField.options)
-          : null;
+          // If our newly created field has options, we need to correlate the old and new option IDs
+          const optionMappings = options
+            ? correlateCustomFieldOptions(options, createdField.options)
+            : null;
 
-        // Store a mapping of the source customer field ID
-        sourceToTargetCustomFieldMappings.set(id, {
-          targetId: createdField.id,
-          optionMappings,
-        });
+          // Store a mapping of the source customer field ID
+          sourceToTargetCustomFieldMappings.set(id, {
+            targetId: createdField.id,
+            optionMappings,
+          });
+        }
       }
-
+      catch (error) {
+        console.log(error)
+      }
       logger.info(`Created ${customFieldsToCreate.length} custom field(s)`);
 
       logger.info('Checking if "Status" field is configured correctly...');
